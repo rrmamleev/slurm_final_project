@@ -1,0 +1,8 @@
+terraform/.terraform
+terraform/.terraform.lock.hcl
+terraform/.terraform.tfstate.lock.info
+terraform/id_rsa
+terraform/id_rsa.pub
+terraform/backup
+terraform/terraform.tfstate
+terraform/terraform.tfstate.backup

@@ -1,0 +1,206 @@
+stages:
+  - lint
+  - build
+  - deploy-terraform
+  - install-gitlab-runner
+  - install-certmanager
+  - install-ingress
+  - install-redis
+  - prepare-db
+  - destroy-terraform
+
+image:
+  name: "$CI_TEMPLATE_REGISTRY_HOST/gitlab-org/terraform-images/releases/1.1:v0.43.0"
+
+variables:
+  TF_ROOT: terraform/
+  TF_STATE_NAME: default
+
+cache:
+  key: "${TF_ROOT}"
+  paths:
+    - ${TF_ROOT}/.terraform/
+
+before_script:
+  - |-
+    cat <<EOF > ~/.terraformrc
+    provider_installation {
+      network_mirror {
+        url = "https://terraform-mirror.yandexcloud.net/"
+        include = ["registry.terraform.io/*/*"]
+      }
+      direct {
+        exclude = ["registry.terraform.io/*/*"]
+      }
+    }
+    EOF
+  - apk add bash curl
+  - curl -sSL https://storage.yandexcloud.net/yandexcloud-yc/install.sh | bash
+  - export PATH="/root/yandex-cloud/bin:$PATH"
+  - yc config profile create sa-profile
+  - yc config set service-account-key $SA_KEY
+  - yc config set cloud-id $TF_VAR_YC_CLOUD_ID
+  - yc config set folder-id $TF_VAR_YC_FOLDER_ID
+  - export TF_VAR_YC_TOKEN=$(yc iam create-token)
+
+lint-yaml:
+  stage: lint
+  image:
+    name: cytopia/yamllint
+    entrypoint: ["/bin/ash", "-c"]
+  before_script:
+    - ''
+  script:
+    - 'yamllint -f colored . -d "{extends: relaxed, ignore: helm/templates, ignore: gitlab-runner/templates, rules: {line-length: {max: 210}}}"'
+
+terraform-validate:
+  stage: lint
+  script:
+    - cd "${TF_ROOT}"
+    - gitlab-terraform init
+    - gitlab-terraform validate
+
+terraform-build:
+  stage: build
+  needs:
+    - lint-yaml
+    - terraform-validate
+  script:
+    - cd "${TF_ROOT}"
+    - gitlab-terraform plan -var="DB_USER=$YELB_DB_USER" -var="DB_PASS=$YELB_DB_PASS" -var="SSH_USER=$SSH_USER" -var="SSH_OPEN_KEY=$SSH_OPEN_KEY" -var="DB_NAME=$YELB_DB_NAME" -var="YELB_APP_DNS_NAME=$YELB_APP_DNS_NAME"
+    - gitlab-terraform plan-json
+  resource_group: ${TF_STATE_NAME}
+  artifacts:
+    reports:
+      terraform: ${TF_ROOT}/plan.json
+    paths:
+      - ${TF_ROOT}/plan.cache
+
+deploy-terraform:
+  stage: deploy-terraform
+  needs:
+    - terraform-build
+  script:
+    - cd "${TF_ROOT}"
+    - gitlab-terraform apply
+    - echo "LB_IP=$(gitlab-terraform output -raw lb-ip)"                 >> /builds/$CI_PROJECT_NAMESPACE/$CI_PROJECT_NAME/build.env
+    - curl -sS --request POST --header "PRIVATE-TOKEN:$GITLAB_PRIVATE_TOKEN" "$YELB_GROUP_GITLAB_API_LINK/variables"
+      --form "key=YELB_DB_ADDR" --form "value=c-$(gitlab-terraform output -raw db-cluster-id).rw.mdb.yandexcloud.net"
+  artifacts:
+    reports:
+      dotenv: build.env
+  resource_group: ${TF_STATE_NAME}
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual
+
+ingress:
+  stage: install-ingress
+  dependencies:
+    - deploy-terraform
+  image:
+    name: alpine/helm:3.10.2
+    entrypoint: [""]
+  script:
+    - yc managed-kubernetes cluster get-credentials k8s-cluster --external --force
+    - helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+    - helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx
+      --set controller.service.loadBalancerIP=$LB_IP
+      --namespace ingress-nginx
+      --create-namespace
+      --version 4.4.2
+      --timeout 300s
+      --atomic
+      --debug
+      --wait
+  when: manual
+
+certmanager:
+  stage: install-certmanager
+  dependencies:
+    - deploy-terraform
+  image: alpine/k8s:1.23.16
+  script:
+    - yc managed-kubernetes cluster get-credentials k8s-cluster --external --force
+    - helm repo add jetstack https://charts.jetstack.io
+    - helm install cert-manager jetstack/cert-manager
+      --namespace cert-manager
+      --create-namespace
+      --version v1.11.0
+      --set installCRDs=true
+      --timeout 300s
+      --atomic
+      --debug
+      --wait
+    - kubectl apply -f acme-issuer.yaml
+  when: manual
+
+gitlab-runner:
+  stage: install-gitlab-runner
+  dependencies:
+    - deploy-terraform
+  image:
+    name: alpine/helm:3.10.2
+    entrypoint: [""]
+  script:
+    - yc managed-kubernetes cluster get-credentials k8s-cluster --external --force
+    - apk add jq
+    - GITLAB_RUNNER_TOKEN=$(curl -s --header "PRIVATE-TOKEN:$GITLAB_PRIVATE_TOKEN" "$YELB_GROUP_GITLAB_API_LINK" | jq -r '.runners_token')
+    - helm upgrade --install gitlab-runner gitlab-runner/
+      --set runnerRegistrationToken=$GITLAB_RUNNER_TOKEN
+      --namespace gitlab-runner
+      --create-namespace
+      --set gitlabUrl=${CI_SERVER_PROTOCOL}://${CI_SERVER_HOST}
+      --timeout 300s
+      --atomic
+      --debug
+      --wait
+  when: manual
+
+redis:
+  stage: install-redis
+  dependencies:
+    - deploy-terraform
+  image:
+    name: alpine/helm:3.10.2
+    entrypoint: [""]
+  script:
+    - yc managed-kubernetes cluster get-credentials k8s-cluster --external --force
+    - helm repo add bitnami https://charts.bitnami.com/bitnami
+    - helm install -n redis redis bitnami/redis
+      --set auth.enabled=false
+      --version 17.7.3
+      --namespace redis
+      --create-namespace
+      --timeout 300s
+      --atomic
+      --debug
+      --wait
+  when: manual
+
+db-prepare:
+  stage: prepare-db
+  image: governmentpaas/psql:b40333a408f9f5c4642ec85c953dddbe9e94dfca
+  tags:
+    - cloud-k8s
+  before_script:
+    - ''
+  dependencies:
+    - deploy-terraform
+  script:
+    - chmod +x init-yelb-db.sh
+    - sh init-yelb-db.sh
+  when: manual
+
+destroy:
+  stage: destroy-terraform
+  tags:
+    - local-k8s
+  script:
+    - apk add curl
+    - cd "${TF_ROOT}"
+    - gitlab-terraform destroy -var="DB_USER=$YELB_DB_USER" -var="DB_PASS=$YELB_DB_PASS" -var="SSH_USER=$SSH_USER" -var="SSH_OPEN_KEY=$SSH_OPEN_KEY" -var="DB_NAME=$YELB_DB_NAME" -var="DB_NAME=$YELB_DB_NAME" -var="YELB_APP_DNS_NAME=$YELB_APP_DNS_NAME"
+    - curl --request DELETE --header "PRIVATE-TOKEN:$GITLAB_PRIVATE_TOKEN"
+      "$YELB_GROUP_GITLAB_API_LINK/variables/YELB_DB_ADDR"
+  resource_group: ${TF_STATE_NAME}
+  when: manual
